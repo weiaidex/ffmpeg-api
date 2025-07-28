@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 import uvicorn
 import os
@@ -15,8 +15,12 @@ def run_ffmpeg_command(command: list):
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg failed: {process.stderr.decode()}")
 
+@app.get("/")
+def root():
+    return {"message": "FFmpeg API is live"}
+
 @app.post("/trim-video")
-async def trim_video(file: UploadFile, start: str = Form(...), duration: str = Form(...)):
+async def trim_video(file: UploadFile = File(...), start: str = Form(...), duration: str = Form(...)):
     input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
     output_path = os.path.join(TMP_DIR, f"trimmed_{uuid.uuid4()}.mp4")
 
@@ -31,7 +35,7 @@ async def trim_video(file: UploadFile, start: str = Form(...), duration: str = F
     return FileResponse(output_path, media_type="video/mp4")
 
 @app.post("/mute-video")
-async def mute_video(file: UploadFile):
+async def mute_video(file: UploadFile = File(...)):
     input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
     output_path = os.path.join(TMP_DIR, f"muted_{uuid.uuid4()}.mp4")
 
@@ -45,7 +49,7 @@ async def mute_video(file: UploadFile):
     return FileResponse(output_path, media_type="video/mp4")
 
 @app.post("/stitch-videos")
-async def stitch_videos(file1: UploadFile, file2: UploadFile):
+async def stitch_videos(file1: UploadFile = File(...), file2: UploadFile = File(...)):
     path1 = os.path.join(TMP_DIR, f"part1_{uuid.uuid4()}.mp4")
     path2 = os.path.join(TMP_DIR, f"part2_{uuid.uuid4()}.mp4")
     concat_path = os.path.join(TMP_DIR, f"concat_{uuid.uuid4()}.mp4")
@@ -65,3 +69,7 @@ async def stitch_videos(file1: UploadFile, file2: UploadFile):
     ])
 
     return FileResponse(concat_path, media_type="video/mp4")
+
+# Optional: for local dev
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=10000)
