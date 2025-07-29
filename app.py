@@ -143,6 +143,25 @@ async def test_video_download(video_url: str = Form(...)):
         except:
             return {"success": False}
 
+@app.get("/check-yt-dlp")
+async def check_yt_dlp():
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        return {
+            "success": result.returncode == 0,
+            "version": result.stdout.decode().strip(),
+            "stderr": result.stderr.decode().strip()
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 # Optional: for local dev
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
