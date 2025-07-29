@@ -1,9 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 import uvicorn
 import os
 import uuid
 import subprocess
+import shutil
 
 app = FastAPI()
 
@@ -15,60 +16,94 @@ def run_ffmpeg_command(command: list):
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg failed: {process.stderr.decode()}")
 
+def cleanup_files(*paths):
+    for path in paths:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
 @app.get("/")
 def root():
     return {"message": "FFmpeg API is live"}
 
 @app.post("/trim-video")
-async def trim_video(file: UploadFile = File(...), start: str = Form(...), duration: str = Form(...)):
-    input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
-    output_path = os.path.join(TMP_DIR, f"trimmed_{uuid.uuid4()}.mp4")
+async def trim_video_from_youtube(
+    video_url: str = Form(...),
+    start: str = Form(...),
+    duration: str = Form(...)
+):
+    video_id = str(uuid.uuid4())
+    input_path = os.path.join(TMP_DIR, f"{video_id}_input.mp4")
+    output_path = os.path.join(TMP_DIR, f"{video_id}_output.mp4")
 
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    run_ffmpeg_command([
-        "ffmpeg", "-ss", start, "-i", input_path,
-        "-t", duration, "-c", "copy", output_path
-    ])
-
-    return FileResponse(output_path, media_type="video/mp4")
+    try:
+        subprocess.run(["yt-dlp", "-f", "best", "-o", input_path, video_url], check=True)
+        run_ffmpeg_command([
+            "ffmpeg", "-ss", start, "-i", input_path,
+            "-t", duration, "-c:v", "libx264", "-c:a", "aac", "-y", output_path
+        ])
+        return FileResponse(output_path, media_type="video/mp4", filename="purple_cow_clip.mp4")
+    finally:
+        cleanup_files(input_path, output_path)
 
 @app.post("/mute-video")
-async def mute_video(file: UploadFile = File(...)):
+async def mute_video(
+    video_url: str = Form(None),
+    file: UploadFile = File(None)
+):
     input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
     output_path = os.path.join(TMP_DIR, f"muted_{uuid.uuid4()}.mp4")
 
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
+    try:
+        if video_url:
+            subprocess.run(["yt-dlp", "-f", "best", "-o", input_path, video_url], check=True)
+        elif file:
+            with open(input_path, "wb") as f_out:
+                f_out.write(await file.read())
+        else:
+            raise HTTPException(400, detail="Must provide either 'video_url' or 'file'.")
 
-    run_ffmpeg_command([
-        "ffmpeg", "-i", input_path, "-an", output_path
-    ])
-
-    return FileResponse(output_path, media_type="video/mp4")
+        run_ffmpeg_command(["ffmpeg", "-i", input_path, "-an", output_path])
+        return FileResponse(output_path, media_type="video/mp4", filename="muted.mp4")
+    finally:
+        cleanup_files(input_path, output_path)
 
 @app.post("/stitch-videos")
-async def stitch_videos(file1: UploadFile = File(...), file2: UploadFile = File(...)):
+async def stitch_videos(
+    video_url_1: str = Form(None),
+    video_url_2: str = Form(None),
+    file1: UploadFile = File(None),
+    file2: UploadFile = File(None)
+):
     path1 = os.path.join(TMP_DIR, f"part1_{uuid.uuid4()}.mp4")
     path2 = os.path.join(TMP_DIR, f"part2_{uuid.uuid4()}.mp4")
     concat_path = os.path.join(TMP_DIR, f"concat_{uuid.uuid4()}.mp4")
     txt_path = os.path.join(TMP_DIR, f"concat_{uuid.uuid4()}.txt")
 
-    with open(path1, "wb") as f:
-        f.write(await file1.read())
-    with open(path2, "wb") as f:
-        f.write(await file2.read())
+    try:
+        if video_url_1 and video_url_2:
+            subprocess.run(["yt-dlp", "-f", "best", "-o", path1, video_url_1], check=True)
+            subprocess.run(["yt-dlp", "-f", "best", "-o", path2, video_url_2], check=True)
+        elif file1 and file2:
+            with open(path1, "wb") as f1:
+                f1.write(await file1.read())
+            with open(path2, "wb") as f2:
+                f2.write(await file2.read())
+        else:
+            raise HTTPException(400, detail="Must provide either two URLs or two uploaded files.")
 
-    with open(txt_path, "w") as f:
-        f.write(f"file '{path1}'\nfile '{path2}'\n")
+        with open(txt_path, "w") as f:
+            f.write(f"file '{path1}'\nfile '{path2}'\n")
 
-    run_ffmpeg_command([
-        "ffmpeg", "-f", "concat", "-safe", "0",
-        "-i", txt_path, "-c", "copy", concat_path
-    ])
+        run_ffmpeg_command([
+            "ffmpeg", "-f", "concat", "-safe", "0",
+            "-i", txt_path, "-c", "copy", concat_path
+        ])
 
-    return FileResponse(concat_path, media_type="video/mp4")
+        return FileResponse(concat_path, media_type="video/mp4", filename="stitched.mp4")
+    finally:
+        cleanup_files(path1, path2, concat_path, txt_path)
 
 # Optional: for local dev
 if __name__ == "__main__":
