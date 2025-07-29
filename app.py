@@ -6,6 +6,7 @@ import os
 import uuid
 import subprocess
 import shutil
+import re
 
 app = FastAPI()
 
@@ -15,10 +16,17 @@ os.makedirs(TMP_DIR, exist_ok=True)
 # Serve the directory at /output publicly
 app.mount("/output", StaticFiles(directory=TMP_DIR), name="output")
 
+
+def slugify(text):
+    text = re.sub(r"[^\w\s-]", "", text.lower())
+    return re.sub(r"[-\s]+", "-", text).strip("-")
+
+
 def run_ffmpeg_command(command: list):
     process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg failed: {process.stderr.decode()}")
+
 
 def cleanup_files(*paths):
     for path in paths:
@@ -27,27 +35,25 @@ def cleanup_files(*paths):
         except Exception:
             pass
 
+
 def download_video(video_url: str, output_path: str):
     yt_dlp_cmd = ["yt-dlp", "-f", "best", "-o", output_path, video_url]
     try:
         subprocess.run(yt_dlp_cmd, check=True)
     except subprocess.CalledProcessError:
-        # Try fallback: piped.video/watch?v=<id>
         video_id = video_url.split("v=")[-1].split("&")[0]
         fallback_url = f"https://piped.video/watch?v={video_id}"
         yt_dlp_cmd[-1] = fallback_url
         subprocess.run(yt_dlp_cmd, check=True)
 
+
 @app.get("/")
 def root():
     return {"message": "FFmpeg API is live"}
 
+
 @app.post("/trim-video")
-async def trim_video_from_youtube(
-    video_url: str = Form(...),
-    start: str = Form(...),
-    duration: str = Form(...),
-):
+async def trim_video_from_youtube(video_url: str = Form(...), start: str = Form(...), duration: str = Form(...)):
     video_id = str(uuid.uuid4())
     input_path = os.path.join(TMP_DIR, f"{video_id}_input.mp4")
     output_path = os.path.join(TMP_DIR, f"{video_id}_output.mp4")
@@ -58,16 +64,13 @@ async def trim_video_from_youtube(
             "ffmpeg", "-ss", start, "-i", input_path,
             "-t", duration, "-c:v", "libx264", "-c:a", "aac", "-y", output_path
         ])
-        public_url = f"/output/{os.path.basename(output_path)}"
-        return {"url": public_url}
+        return {"url": f"/output/{os.path.basename(output_path)}"}
     finally:
         cleanup_files(input_path)
 
+
 @app.post("/mute-video")
-async def mute_video(
-    video_url: str = Form(None),
-    file: UploadFile = File(None)
-):
+async def mute_video(video_url: str = Form(None), file: UploadFile = File(None)):
     input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
     output_path = os.path.join(TMP_DIR, f"muted_{uuid.uuid4()}.mp4")
 
@@ -81,18 +84,13 @@ async def mute_video(
             raise HTTPException(400, detail="Must provide either 'video_url' or 'file'.")
 
         run_ffmpeg_command(["ffmpeg", "-i", input_path, "-an", output_path])
-        public_url = f"/output/{os.path.basename(output_path)}"
-        return {"url": public_url}
+        return {"url": f"/output/{os.path.basename(output_path)}"}
     finally:
         cleanup_files(input_path)
 
+
 @app.post("/stitch-videos")
-async def stitch_videos(
-    video_url_1: str = Form(None),
-    video_url_2: str = Form(None),
-    file1: UploadFile = File(None),
-    file2: UploadFile = File(None)
-):
+async def stitch_videos(video_url_1: str = Form(None), video_url_2: str = Form(None), file1: UploadFile = File(None), file2: UploadFile = File(None)):
     path1 = os.path.join(TMP_DIR, f"part1_{uuid.uuid4()}.mp4")
     path2 = os.path.join(TMP_DIR, f"part2_{uuid.uuid4()}.mp4")
     concat_path = os.path.join(TMP_DIR, f"concat_{uuid.uuid4()}.mp4")
@@ -113,55 +111,60 @@ async def stitch_videos(
         with open(txt_path, "w") as f:
             f.write(f"file '{path1}'\nfile '{path2}'\n")
 
-        run_ffmpeg_command([
-            "ffmpeg", "-f", "concat", "-safe", "0",
-            "-i", txt_path, "-c", "copy", concat_path
-        ])
-
-        public_url = f"/output/{os.path.basename(concat_path)}"
-        return {"url": public_url}
+        run_ffmpeg_command(["ffmpeg", "-f", "concat", "-safe", "0", "-i", txt_path, "-c", "copy", concat_path])
+        return {"url": f"/output/{os.path.basename(concat_path)}"}
     finally:
         cleanup_files(path1, path2, txt_path)
+
+
+@app.post("/phase1-snapshots")
+async def extract_snapshots(video_url: str = Form(...), interval: int = Form(...)):
+    input_path = os.path.join(TMP_DIR, f"input_{uuid.uuid4()}.mp4")
+    output_prefix = os.path.join(TMP_DIR, f"snapshot_%03d.jpg")
+
+    try:
+        download_video(video_url, input_path)
+        run_ffmpeg_command(["ffmpeg", "-i", input_path, "-vf", f"fps=1/{interval}", output_prefix])
+        images = sorted([f for f in os.listdir(TMP_DIR) if f.startswith("snapshot_") and f.endswith(".jpg")])
+        return {"snapshots": [f"/output/{img}" for img in images]}
+    finally:
+        cleanup_files(input_path)
+
+
+@app.post("/phase2-clip")
+async def extract_clip(video_url: str = Form(...), theme: str = Form(...), moment_index: int = Form(...)):
+    start_sec = max(0, moment_index * 15 - 7)
+    duration = 15
+    slug = slugify(theme)
+
+    input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
+    output_path = os.path.join(TMP_DIR, f"{slug}_purplecow.mp4")
+
+    try:
+        download_video(video_url, input_path)
+        run_ffmpeg_command([
+            "ffmpeg", "-ss", str(start_sec), "-i", input_path,
+            "-t", str(duration), "-r", "25", "-y", output_path
+        ])
+        return {"url": f"/output/{os.path.basename(output_path)}"}
+    finally:
+        cleanup_files(input_path)
+
 
 @app.post("/test-video")
 async def test_video_download(video_url: str = Form(...)):
     try:
-        subprocess.run(
-            ["yt-dlp", "--simulate", "--quiet", video_url],
-            check=True
-        )
+        subprocess.run(["yt-dlp", "--simulate", "--quiet", video_url], check=True)
         return {"success": True}
     except subprocess.CalledProcessError:
         try:
             video_id = video_url.split("v=")[-1].split("&")[0]
             fallback_url = f"https://piped.video/watch?v={video_id}"
-            subprocess.run(
-                ["yt-dlp", "--simulate", "--quiet", fallback_url],
-                check=True
-            )
+            subprocess.run(["yt-dlp", "--simulate", "--quiet", fallback_url], check=True)
             return {"success": True}
         except:
             return {"success": False}
 
-@app.get("/check-yt-dlp")
-async def check_yt_dlp():
-    try:
-        result = subprocess.run(
-            ["yt-dlp", "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        return {
-            "success": result.returncode == 0,
-            "version": result.stdout.decode().strip(),
-            "stderr": result.stderr.decode().strip()
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
 
-# Optional: for local dev
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
