@@ -42,7 +42,11 @@ async def trim_video_from_youtube(
     output_path = os.path.join(TMP_DIR, f"{video_id}_output.mp4")
 
     try:
-        subprocess.run(["yt-dlp", "-f", "best", "-o", input_path, video_url], check=True)
+        subprocess.run([
+            "yt-dlp", "--geo-bypass", "--user-agent", "Mozilla/5.0",
+            "-f", "best", "-o", input_path, video_url
+        ], check=True)
+
         run_ffmpeg_command([
             "ffmpeg", "-ss", start, "-i", input_path,
             "-t", duration, "-c:v", "libx264", "-c:a", "aac", "-y", output_path
@@ -62,7 +66,10 @@ async def mute_video(
 
     try:
         if video_url:
-            subprocess.run(["yt-dlp", "-f", "best", "-o", input_path, video_url], check=True)
+            subprocess.run([
+                "yt-dlp", "--geo-bypass", "--user-agent", "Mozilla/5.0",
+                "-f", "best", "-o", input_path, video_url
+            ], check=True)
         elif file:
             with open(input_path, "wb") as f_out:
                 f_out.write(await file.read())
@@ -89,8 +96,14 @@ async def stitch_videos(
 
     try:
         if video_url_1 and video_url_2:
-            subprocess.run(["yt-dlp", "-f", "best", "-o", path1, video_url_1], check=True)
-            subprocess.run(["yt-dlp", "-f", "best", "-o", path2, video_url_2], check=True)
+            subprocess.run([
+                "yt-dlp", "--geo-bypass", "--user-agent", "Mozilla/5.0",
+                "-f", "best", "-o", path1, video_url_1
+            ], check=True)
+            subprocess.run([
+                "yt-dlp", "--geo-bypass", "--user-agent", "Mozilla/5.0",
+                "-f", "best", "-o", path2, video_url_2
+            ], check=True)
         elif file1 and file2:
             with open(path1, "wb") as f1:
                 f1.write(await file1.read())
