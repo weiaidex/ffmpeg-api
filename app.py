@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
 import uuid
@@ -10,6 +11,9 @@ app = FastAPI()
 
 TMP_DIR = "/tmp/videos"
 os.makedirs(TMP_DIR, exist_ok=True)
+
+# Serve the directory at /output publicly
+app.mount("/output", StaticFiles(directory=TMP_DIR), name="output")
 
 def run_ffmpeg_command(command: list):
     process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -31,7 +35,7 @@ def root():
 async def trim_video_from_youtube(
     video_url: str = Form(...),
     start: str = Form(...),
-    duration: str = Form(...)
+    duration: str = Form(...),
 ):
     video_id = str(uuid.uuid4())
     input_path = os.path.join(TMP_DIR, f"{video_id}_input.mp4")
@@ -43,9 +47,10 @@ async def trim_video_from_youtube(
             "ffmpeg", "-ss", start, "-i", input_path,
             "-t", duration, "-c:v", "libx264", "-c:a", "aac", "-y", output_path
         ])
-        return FileResponse(output_path, media_type="video/mp4", filename="purple_cow_clip.mp4")
+        public_url = f"/output/{os.path.basename(output_path)}"
+        return {"url": public_url}
     finally:
-        cleanup_files(input_path, output_path)
+        cleanup_files(input_path)
 
 @app.post("/mute-video")
 async def mute_video(
@@ -65,9 +70,10 @@ async def mute_video(
             raise HTTPException(400, detail="Must provide either 'video_url' or 'file'.")
 
         run_ffmpeg_command(["ffmpeg", "-i", input_path, "-an", output_path])
-        return FileResponse(output_path, media_type="video/mp4", filename="muted.mp4")
+        public_url = f"/output/{os.path.basename(output_path)}"
+        return {"url": public_url}
     finally:
-        cleanup_files(input_path, output_path)
+        cleanup_files(input_path)
 
 @app.post("/stitch-videos")
 async def stitch_videos(
@@ -101,9 +107,10 @@ async def stitch_videos(
             "-i", txt_path, "-c", "copy", concat_path
         ])
 
-        return FileResponse(concat_path, media_type="video/mp4", filename="stitched.mp4")
+        public_url = f"/output/{os.path.basename(concat_path)}"
+        return {"url": public_url}
     finally:
-        cleanup_files(path1, path2, concat_path, txt_path)
+        cleanup_files(path1, path2, txt_path)
 
 # Optional: for local dev
 if __name__ == "__main__":
