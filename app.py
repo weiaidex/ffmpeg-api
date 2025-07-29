@@ -12,8 +12,6 @@ app = FastAPI()
 TMP_DIR = "/tmp/videos"
 os.makedirs(TMP_DIR, exist_ok=True)
 
-COOKIES_PATH = "/app/cookies.txt"  # Optional: provide a cookies.txt file via volume or deployment
-
 # Serve the directory at /output publicly
 app.mount("/output", StaticFiles(directory=TMP_DIR), name="output")
 
@@ -30,11 +28,7 @@ def cleanup_files(*paths):
             pass
 
 def download_video(video_url: str, output_path: str):
-    yt_dlp_cmd = ["yt-dlp"]
-    if os.path.exists(COOKIES_PATH):
-        yt_dlp_cmd += ["--cookies", COOKIES_PATH]
-    yt_dlp_cmd += ["-f", "best", "-o", output_path, video_url]
-
+    yt_dlp_cmd = ["yt-dlp", "-f", "best", "-o", output_path, video_url]
     try:
         subprocess.run(yt_dlp_cmd, check=True)
     except subprocess.CalledProcessError:
@@ -42,7 +36,7 @@ def download_video(video_url: str, output_path: str):
         video_id = video_url.split("v=")[-1].split("&")[0]
         fallback_url = f"https://piped.video/watch?v={video_id}"
         yt_dlp_cmd[-1] = fallback_url
-        subprocess.run(yt_dlp_cmd, check=True)  # Let this raise if it fails again
+        subprocess.run(yt_dlp_cmd, check=True)
 
 @app.get("/")
 def root():
@@ -128,6 +122,26 @@ async def stitch_videos(
         return {"url": public_url}
     finally:
         cleanup_files(path1, path2, txt_path)
+
+@app.post("/test-video")
+async def test_video_download(video_url: str = Form(...)):
+    try:
+        subprocess.run(
+            ["yt-dlp", "--simulate", "--quiet", video_url],
+            check=True
+        )
+        return {"success": True}
+    except subprocess.CalledProcessError:
+        try:
+            video_id = video_url.split("v=")[-1].split("&")[0]
+            fallback_url = f"https://piped.video/watch?v={video_id}"
+            subprocess.run(
+                ["yt-dlp", "--simulate", "--quiet", fallback_url],
+                check=True
+            )
+            return {"success": True}
+        except:
+            return {"success": False}
 
 # Optional: for local dev
 if __name__ == "__main__":
