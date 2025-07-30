@@ -1,170 +1,106 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-import uvicorn
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import FileResponse, JSONResponse
 import os
 import uuid
 import subprocess
 import shutil
 import re
+import requests
 
 app = FastAPI()
 
 TMP_DIR = "/tmp/videos"
+SNAPSHOT_DIR = "/tmp/snapshots"
 os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
-# Serve the directory at /output publicly
-app.mount("/output", StaticFiles(directory=TMP_DIR), name="output")
-
-
+# --- Utilities ---
 def slugify(text):
-    text = re.sub(r"[^\w\s-]", "", text.lower())
-    return re.sub(r"[-\s]+", "-", text).strip("-")
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    return text.strip('-')
 
-
-def run_ffmpeg_command(command: list):
+def run_ffmpeg_command(command):
     process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg failed: {process.stderr.decode()}")
 
+def download_with_ytdlp(url, output_path):
+    command = [
+        'yt-dlp', '-f', 'best', '-o', output_path, url
+    ]
+    subprocess.run(command, check=True)
 
-def cleanup_files(*paths):
-    for path in paths:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+def download_with_browserless(video_url, slug):
+    # Browserless Screenshot capture logic
+    payload = {
+        "url": video_url,
+        "options": {
+            "fullPage": True
+        }
+    }
+    snapshot_path = os.path.join(SNAPSHOT_DIR, slug)
+    os.makedirs(snapshot_path, exist_ok=True)
 
+    for i in range(0, 900, 15):  # Assume max 15min videos
+        ss_url = f"https://chrome.browserless.io/screenshot?token=YOUR_BROWSERLESS_TOKEN"
+        payload["options"]["clip"] = {
+            "x": 0, "y": 0, "width": 720, "height": 1280
+        }
+        payload["gotoOptions"] = {"waitUntil": "networkidle0", "timeout": 10000}
+        payload["wait"] = 15000 * (i // 15)  # delay in ms
 
-def download_video(video_url: str, output_path: str):
-    yt_dlp_cmd = ["yt-dlp", "-f", "best", "-o", output_path, video_url]
-    try:
-        subprocess.run(yt_dlp_cmd, check=True)
-    except subprocess.CalledProcessError:
-        video_id = video_url.split("v=")[-1].split("&")[0]
-        fallback_url = f"https://piped.video/watch?v={video_id}"
-        yt_dlp_cmd[-1] = fallback_url
-        subprocess.run(yt_dlp_cmd, check=True)
-
-
-@app.get("/")
-def root():
-    return {"message": "FFmpeg API is live"}
-
-
-@app.post("/trim-video")
-async def trim_video_from_youtube(video_url: str = Form(...), start: str = Form(...), duration: str = Form(...)):
-    video_id = str(uuid.uuid4())
-    input_path = os.path.join(TMP_DIR, f"{video_id}_input.mp4")
-    output_path = os.path.join(TMP_DIR, f"{video_id}_output.mp4")
-
-    try:
-        download_video(video_url, input_path)
-        run_ffmpeg_command([
-            "ffmpeg", "-ss", start, "-i", input_path,
-            "-t", duration, "-c:v", "libx264", "-c:a", "aac", "-y", output_path
-        ])
-        return {"url": f"/output/{os.path.basename(output_path)}"}
-    finally:
-        cleanup_files(input_path)
-
-
-@app.post("/mute-video")
-async def mute_video(video_url: str = Form(None), file: UploadFile = File(None)):
-    input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
-    output_path = os.path.join(TMP_DIR, f"muted_{uuid.uuid4()}.mp4")
-
-    try:
-        if video_url:
-            download_video(video_url, input_path)
-        elif file:
-            with open(input_path, "wb") as f_out:
-                f_out.write(await file.read())
+        response = requests.post(ss_url, json=payload)
+        if response.status_code == 200:
+            with open(f"{snapshot_path}/frame_{i}.jpg", "wb") as f:
+                f.write(response.content)
         else:
-            raise HTTPException(400, detail="Must provide either 'video_url' or 'file'.")
+            break
 
-        run_ffmpeg_command(["ffmpeg", "-i", input_path, "-an", output_path])
-        return {"url": f"/output/{os.path.basename(output_path)}"}
-    finally:
-        cleanup_files(input_path)
+    return JSONResponse({"message": "Browserless snapshots complete", "slug": slug})
 
+def take_snapshots_with_ffmpeg(video_path, slug, interval):
+    output_dir = os.path.join(SNAPSHOT_DIR, slug)
+    os.makedirs(output_dir, exist_ok=True)
+    snapshot_pattern = os.path.join(output_dir, "frame_%04d.jpg")
+    run_ffmpeg_command([
+        "ffmpeg", "-i", video_path,
+        "-vf", f"fps=1/{interval}",
+        snapshot_pattern
+    ])
+    return JSONResponse({"message": "Snapshots complete", "slug": slug})
 
-@app.post("/stitch-videos")
-async def stitch_videos(video_url_1: str = Form(None), video_url_2: str = Form(None), file1: UploadFile = File(None), file2: UploadFile = File(None)):
-    path1 = os.path.join(TMP_DIR, f"part1_{uuid.uuid4()}.mp4")
-    path2 = os.path.join(TMP_DIR, f"part2_{uuid.uuid4()}.mp4")
-    concat_path = os.path.join(TMP_DIR, f"concat_{uuid.uuid4()}.mp4")
-    txt_path = os.path.join(TMP_DIR, f"concat_{uuid.uuid4()}.txt")
+def trim_and_stitch(slug, second):
+    input_path = os.path.join(TMP_DIR, f"{slug}.mp4")
+    output_path = os.path.join(TMP_DIR, f"Video Theme - {slug}.mp4")
+    start = max(0, second - 7)
+    run_ffmpeg_command([
+        "ffmpeg", "-ss", str(start), "-i", input_path,
+        "-t", "15", "-an", output_path
+    ])
+    return FileResponse(output_path, media_type="video/mp4")
+
+# --- Routes ---
+@app.post("/snapshots-phase1")
+async def phase1_snapshots(video_url: str = Form(...), slug: str = Form(...), interval: int = Form(...)):
+    slug = slugify(slug)
+    temp_path = os.path.join(TMP_DIR, f"{uuid.uuid4()}.mp4")
 
     try:
-        if video_url_1 and video_url_2:
-            download_video(video_url_1, path1)
-            download_video(video_url_2, path2)
-        elif file1 and file2:
-            with open(path1, "wb") as f1:
-                f1.write(await file1.read())
-            with open(path2, "wb") as f2:
-                f2.write(await file2.read())
+        if video_url.endswith(".mp4") or "youtube.com" in video_url:
+            download_with_ytdlp(video_url, temp_path)
+            return take_snapshots_with_ffmpeg(temp_path, slug, interval)
         else:
-            raise HTTPException(400, detail="Must provide either two URLs or two uploaded files.")
+            return download_with_browserless(video_url, slug)
 
-        with open(txt_path, "w") as f:
-            f.write(f"file '{path1}'\nfile '{path2}'\n")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-        run_ffmpeg_command(["ffmpeg", "-f", "concat", "-safe", "0", "-i", txt_path, "-c", "copy", concat_path])
-        return {"url": f"/output/{os.path.basename(concat_path)}"}
-    finally:
-        cleanup_files(path1, path2, txt_path)
-
-
-@app.post("/phase1-snapshots")
-async def extract_snapshots(video_url: str = Form(...), interval: int = Form(...)):
-    input_path = os.path.join(TMP_DIR, f"input_{uuid.uuid4()}.mp4")
-    output_prefix = os.path.join(TMP_DIR, f"snapshot_%03d.jpg")
-
+@app.post("/clip-phase2")
+async def phase2_clip(slug: str = Form(...), moment_index: int = Form(...), interval: int = Form(...)):
+    slug = slugify(slug)
+    second = moment_index * interval
     try:
-        download_video(video_url, input_path)
-        run_ffmpeg_command(["ffmpeg", "-i", input_path, "-vf", f"fps=1/{interval}", output_prefix])
-        images = sorted([f for f in os.listdir(TMP_DIR) if f.startswith("snapshot_") and f.endswith(".jpg")])
-        return {"snapshots": [f"/output/{img}" for img in images]}
-    finally:
-        cleanup_files(input_path)
-
-
-@app.post("/phase2-clip")
-async def extract_clip(video_url: str = Form(...), theme: str = Form(...), moment_index: int = Form(...)):
-    start_sec = max(0, moment_index * 15 - 7)
-    duration = 15
-    slug = slugify(theme)
-
-    input_path = os.path.join(TMP_DIR, f"in_{uuid.uuid4()}.mp4")
-    output_path = os.path.join(TMP_DIR, f"{slug}_purplecow.mp4")
-
-    try:
-        download_video(video_url, input_path)
-        run_ffmpeg_command([
-            "ffmpeg", "-ss", str(start_sec), "-i", input_path,
-            "-t", str(duration), "-r", "25", "-y", output_path
-        ])
-        return {"url": f"/output/{os.path.basename(output_path)}"}
-    finally:
-        cleanup_files(input_path)
-
-
-@app.post("/test-video")
-async def test_video_download(video_url: str = Form(...)):
-    try:
-        subprocess.run(["yt-dlp", "--simulate", "--quiet", video_url], check=True)
-        return {"success": True}
-    except subprocess.CalledProcessError:
-        try:
-            video_id = video_url.split("v=")[-1].split("&")[0]
-            fallback_url = f"https://piped.video/watch?v={video_id}"
-            subprocess.run(["yt-dlp", "--simulate", "--quiet", fallback_url], check=True)
-            return {"success": True}
-        except:
-            return {"success": False}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+        return trim_and_stitch(slug, second)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
