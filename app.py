@@ -31,26 +31,31 @@ def download_with_ytdlp(url, output_path):
     ]
     subprocess.run(command, check=True)
 
-def download_with_browserless(video_url, slug):
-    # Browserless Screenshot capture logic
+def download_with_browserless(video_url, slug, interval, max_duration):
+    """
+    Use Browserless to capture screenshots of video page every `interval` seconds,
+    up to `max_duration` seconds (e.g. 300 = 5 minutes).
+    """
     payload = {
         "url": video_url,
         "options": {
-            "fullPage": True
-        }
+            "fullPage": True,
+            "clip": {
+                "x": 0, "y": 0, "width": 720, "height": 1280
+            }
+        },
+        "gotoOptions": {"waitUntil": "networkidle0", "timeout": 10000}
     }
+
     snapshot_path = os.path.join(SNAPSHOT_DIR, slug)
     os.makedirs(snapshot_path, exist_ok=True)
 
-    for i in range(0, 900, 15):  # Assume max 15min videos
-        ss_url = f"https://chrome.browserless.io/screenshot?token=YOUR_BROWSERLESS_TOKEN"
-        payload["options"]["clip"] = {
-            "x": 0, "y": 0, "width": 720, "height": 1280
-        }
-        payload["gotoOptions"] = {"waitUntil": "networkidle0", "timeout": 10000}
-        payload["wait"] = 15000 * (i // 15)  # delay in ms
+    for i in range(0, max_duration, interval):
+        payload["wait"] = i * 1000  # delay in ms before capturing screenshot
 
+        ss_url = "https://chrome.browserless.io/screenshot?token=YOUR_BROWSERLESS_TOKEN"
         response = requests.post(ss_url, json=payload)
+
         if response.status_code == 200:
             with open(f"{snapshot_path}/frame_{i}.jpg", "wb") as f:
                 f.write(response.content)
@@ -60,6 +65,9 @@ def download_with_browserless(video_url, slug):
     return JSONResponse({"message": "Browserless snapshots complete", "slug": slug})
 
 def take_snapshots_with_ffmpeg(video_path, slug, interval):
+    """
+    Use FFmpeg to extract one frame every `interval` seconds from video file.
+    """
     output_dir = os.path.join(SNAPSHOT_DIR, slug)
     os.makedirs(output_dir, exist_ok=True)
     snapshot_pattern = os.path.join(output_dir, "frame_%04d.jpg")
@@ -71,6 +79,10 @@ def take_snapshots_with_ffmpeg(video_path, slug, interval):
     return JSONResponse({"message": "Snapshots complete", "slug": slug})
 
 def trim_and_stitch(slug, second):
+    """
+    Trim 15-second clip from the video file starting from (second - 7), mute audio,
+    and return output MP4.
+    """
     input_path = os.path.join(TMP_DIR, f"{slug}.mp4")
     output_path = os.path.join(TMP_DIR, f"Video Theme - {slug}.mp4")
     start = max(0, second - 7)
@@ -86,7 +98,17 @@ def root():
     return {"message": "FFmpeg API is running"}
 
 @app.post("/snapshots-phase1")
-async def phase1_snapshots(video_url: str = Form(...), slug: str = Form(...), interval: int = Form(...)):
+async def phase1_snapshots(
+    video_url: str = Form(...),
+    slug: str = Form(...),
+    interval: int = Form(...),
+    max_duration: int = Form(...)  # max seconds to capture snapshots (e.g. 300 = 5 minutes)
+):
+    """
+    Phase 1: Take snapshots either via yt-dlp (for MP4/YouTube) or Browserless (for HTML video).
+    `interval`: seconds between each snapshot
+    `max_duration`: total duration to sample over (in seconds)
+    """
     slug = slugify(slug)
     temp_path = os.path.join(TMP_DIR, f"{uuid.uuid4()}.mp4")
 
@@ -95,13 +117,22 @@ async def phase1_snapshots(video_url: str = Form(...), slug: str = Form(...), in
             download_with_ytdlp(video_url, temp_path)
             return take_snapshots_with_ffmpeg(temp_path, slug, interval)
         else:
-            return download_with_browserless(video_url, slug)
+            return download_with_browserless(video_url, slug, interval, max_duration)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/clip-phase2")
-async def phase2_clip(slug: str = Form(...), moment_index: int = Form(...), interval: int = Form(...)):
+async def phase2_clip(
+    slug: str = Form(...),
+    moment_index: int = Form(...),
+    interval: int = Form(...)
+):
+    """
+    Phase 2: Extract 15-second clip from snapshot index.
+    `moment_index` is the index of the selected moment (e.g. 12 = 12th snapshot).
+    `interval` is same as used in Phase 1.
+    """
     slug = slugify(slug)
     second = moment_index * interval
     try:
