@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 import os
 import uuid
@@ -25,17 +25,21 @@ def run_ffmpeg_command(command):
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg failed: {process.stderr.decode()}")
 
+def rewrite_to_piped_url(original_url):
+    match = re.search(r"v=([^&]+)", original_url)
+    if match:
+        video_id = match.group(1)
+        return f"https://piped.video/watch?v={video_id}"
+    return original_url
+
 def download_with_ytdlp(url, output_path):
-    command = [
-        'yt-dlp', '-f', 'best', '-o', output_path, url
-    ]
-    subprocess.run(command, check=True)
+    try:
+        subprocess.run(['yt-dlp', '-f', 'best', '-o', output_path, url], check=True)
+    except subprocess.CalledProcessError:
+        fallback_url = rewrite_to_piped_url(url)
+        subprocess.run(['yt-dlp', '-f', 'best', '-o', output_path, fallback_url], check=True)
 
 def download_with_browserless(video_url, slug, interval, max_duration):
-    """
-    Use Browserless to capture screenshots of video page every `interval` seconds,
-    up to `max_duration` seconds (e.g. 300 = 5 minutes).
-    """
     payload = {
         "url": video_url,
         "options": {
@@ -51,11 +55,9 @@ def download_with_browserless(video_url, slug, interval, max_duration):
     os.makedirs(snapshot_path, exist_ok=True)
 
     for i in range(0, max_duration, interval):
-        payload["wait"] = i * 1000  # delay in ms before capturing screenshot
-
+        payload["wait"] = i * 1000
         ss_url = "https://chrome.browserless.io/screenshot?token=YOUR_BROWSERLESS_TOKEN"
         response = requests.post(ss_url, json=payload)
-
         if response.status_code == 200:
             with open(f"{snapshot_path}/frame_{i}.jpg", "wb") as f:
                 f.write(response.content)
@@ -65,9 +67,6 @@ def download_with_browserless(video_url, slug, interval, max_duration):
     return JSONResponse({"message": "Browserless snapshots complete", "slug": slug})
 
 def take_snapshots_with_ffmpeg(video_path, slug, interval):
-    """
-    Use FFmpeg to extract one frame every `interval` seconds from video file.
-    """
     output_dir = os.path.join(SNAPSHOT_DIR, slug)
     os.makedirs(output_dir, exist_ok=True)
     snapshot_pattern = os.path.join(output_dir, "frame_%04d.jpg")
@@ -78,37 +77,18 @@ def take_snapshots_with_ffmpeg(video_path, slug, interval):
     ])
     return JSONResponse({"message": "Snapshots complete", "slug": slug})
 
-def trim_and_stitch(slug, second):
-    """
-    Trim 15-second clip from the video file starting from (second - 7), mute audio,
-    and return output MP4.
-    """
-    input_path = os.path.join(TMP_DIR, f"{slug}.mp4")
-    output_path = os.path.join(TMP_DIR, f"Video Theme - {slug}.mp4")
-    start = max(0, second - 7)
-    run_ffmpeg_command([
-        "ffmpeg", "-ss", str(start), "-i", input_path,
-        "-t", "15", "-an", output_path
-    ])
-    return FileResponse(output_path, media_type="video/mp4")
-
 # --- Routes ---
 @app.get("/")
 def root():
     return {"message": "FFmpeg API is running"}
 
-@app.post("/snapshots-phase1")
-async def phase1_snapshots(
+@app.post("/snapshots")
+async def take_snapshots(
     video_url: str = Form(...),
     slug: str = Form(...),
     interval: int = Form(...),
-    max_duration: int = Form(...)  # max seconds to capture snapshots (e.g. 300 = 5 minutes)
+    max_duration: int = Form(...)
 ):
-    """
-    Phase 1: Take snapshots either via yt-dlp (for MP4/YouTube) or Browserless (for HTML video).
-    `interval`: seconds between each snapshot
-    `max_duration`: total duration to sample over (in seconds)
-    """
     slug = slugify(slug)
     temp_path = os.path.join(TMP_DIR, f"{uuid.uuid4()}.mp4")
 
@@ -122,20 +102,45 @@ async def phase1_snapshots(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.post("/clip-phase2")
-async def phase2_clip(
+@app.post("/clip")
+async def generate_clip(
+    background_tasks: BackgroundTasks,
     slug: str = Form(...),
     moment_index: int = Form(...),
-    interval: int = Form(...)
+    interval: int = Form(...),
+    clip_duration: int = Form(15)
 ):
-    """
-    Phase 2: Extract 15-second clip from snapshot index.
-    `moment_index` is the index of the selected moment (e.g. 12 = 12th snapshot).
-    `interval` is same as used in Phase 1.
-    """
     slug = slugify(slug)
     second = moment_index * interval
+    clip_duration = max(15, min(clip_duration, 60))
+    start = max(0, second - (clip_duration // 2))
+
+    input_path = os.path.join(TMP_DIR, f"{slug}.mp4")
+    output_path = os.path.join(TMP_DIR, f"Video Theme - {slug}.mp4")
+
     try:
-        return trim_and_stitch(slug, second)
+        run_ffmpeg_command([
+            "ffmpeg", "-ss", str(start), "-i", input_path,
+            "-t", str(clip_duration), "-an", output_path
+        ])
+        background_tasks.add_task(os.remove, input_path)
+        background_tasks.add_task(os.remove, output_path)
+        return FileResponse(output_path, media_type="video/mp4")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/duration")
+async def get_video_duration(video_url: str = Form(...)):
+    temp_path = os.path.join(TMP_DIR, f"{uuid.uuid4()}.mp4")
+    try:
+        download_with_ytdlp(video_url, temp_path)
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration", "-of",
+            "default=noprint_wrappers=1:nokey=1", temp_path
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        duration = float(result.stdout.decode().strip())
+        os.remove(temp_path)
+        return JSONResponse({"duration": duration})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
