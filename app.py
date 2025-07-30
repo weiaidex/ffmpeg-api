@@ -81,6 +81,10 @@ def trim_and_stitch(slug, second):
     return FileResponse(output_path, media_type="video/mp4")
 
 # --- Routes ---
+@app.get("/")
+def root():
+    return {"message": "FFmpeg API is running"}
+
 @app.post("/snapshots-phase1")
 async def phase1_snapshots(video_url: str = Form(...), slug: str = Form(...), interval: int = Form(...)):
     slug = slugify(slug)
