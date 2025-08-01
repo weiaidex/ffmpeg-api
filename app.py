@@ -1,3 +1,4 @@
+# Version 1.0.4
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 import os
@@ -6,6 +7,7 @@ import subprocess
 import shutil
 import re
 import requests
+from slugify import slugify
 
 app = FastAPI()
 
@@ -15,11 +17,6 @@ os.makedirs(TMP_DIR, exist_ok=True)
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 # --- Utilities ---
-def slugify(text):
-    text = text.lower()
-    text = re.sub(r'[^a-z0-9]+', '-', text)
-    return text.strip('-')
-
 def run_ffmpeg_command(command):
     process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if process.returncode != 0:
@@ -34,10 +31,22 @@ def rewrite_to_piped_url(original_url):
 
 def download_with_ytdlp(url, output_path):
     try:
-        subprocess.run(['yt-dlp', '-f', 'best', '-o', output_path, url], check=True)
+        subprocess.run([
+            'yt-dlp',
+            '--cookies', 'cookies.txt',
+            '-f', 'best',
+            '-o', output_path,
+            url
+        ], check=True)
     except subprocess.CalledProcessError:
         fallback_url = rewrite_to_piped_url(url)
-        subprocess.run(['yt-dlp', '-f', 'best', '-o', output_path, fallback_url], check=True)
+        subprocess.run([
+            'yt-dlp',
+            '--cookies', 'cookies.txt',
+            '-f', 'best',
+            '-o', output_path,
+            fallback_url
+        ], check=True)
 
 def download_with_browserless(video_url, slug, interval, max_duration):
     payload = {
